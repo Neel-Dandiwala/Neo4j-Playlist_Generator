@@ -20,14 +20,37 @@ def load_graph():
     print("Create Songs")
     songs = get_songs()
     songs = get_song_audio_features(songs)
-    neo4j.run("UNWIND $songs as track CREATE (t:Track {id: track.id}) SET t = track",
+    neo4j.run("UNWIND $tracks as track CREATE (t:Track {id: track.id}) SET t = track",
             parameters={'tracks': list(songs.values())})
+    
+    print("Create Albums")
+    albums = get_album_info(songs)
+    neo4j.run("UNWIND $albums as album CREATE (a:Album {id: album.id}) SET a = album",
+            parameters={'albums': list(albums.values())})
+    
+    print("Create Artists")
+    artists = get_artist_info(songs)
+    neo4j.run("UNWIND $artists as artist CREATE (a:Artist {id: artist.id}) SET a = artist",
+            parameters={'artists': list(artists.values())})
+    
+    print("Create Genres")
+    genres = get_genres(albums, artists)
+    neo4j.run("UNWIND $genres as genre MERGE (g:Genre {name: genre})",
+            parameters={'genres': list(genres)})
+    
+    print("Linking tracks to albums, genres, and artists")
+    neo4j.run("MATCH (t:Track), (a:Album {id: t.album}) CREATE (t)-[:IN_ALBUM]->(a);")
+    neo4j.run("MATCH (t:Track) UNWIND t.artists as artist MATCH (a:Artist {id: artist}) CREATE (t)-[:HAS_ARTIST]->(a)")
+    neo4j.run("MATCH (a:Artist) UNWIND a.genres as genre MATCH (g:Genre{name: genre}) CREATE (a)-[:HAS_GENRE]->(g)")
+    
+    print("Clustering Genre using GDS to create Super-Genre")
+    cluster_genres(neo4j)
 
 def create_constraints(neo4j):
     res = neo4j.run("SHOW CONSTRAINTS")
     
     for constraint in res:
-        print(constraint)
+        # print(constraint)
         # res = neo4j.run("DROP "+ constraint['labelsOrTypes'][0])
         res = neo4j.run("DROP CONSTRAINT " + constraint['name'])
         
@@ -38,6 +61,75 @@ def create_constraints(neo4j):
     neo4j.run("CREATE CONSTRAINT FOR (a:Artist) REQUIRE a.id IS UNIQUE")
     neo4j.run("CREATE CONSTRAINT FOR (t:Track) REQUIRE t.id IS UNIQUE")
     neo4j.run("MATCH (n) DETACH DELETE n;")
+
+def cluster_genres(neo4j):
+    res = neo4j.run("""
+            CALL gds.graph.exists($name) YIELD exists WHERE exists CALL gds.graph.drop($name) YIELD graphName
+            RETURN graphName + " was dropped." as message
+            """, name='genre-has-artist')
+    
+    res = neo4j.run("""
+            CALL gds.graph.exists($name) YIELD exists WHERE exists CALL gds.graph.drop($name) YIELD graphName
+            RETURN graphName + " was dropped." as message
+            """, name='genre-similar-to-genre')
+    
+    res = neo4j.run("""
+            CALL gds.graph.project.cypher(
+                'genre-has-artist',
+                'MATCH (p) WHERE p:Artist OR p:Genre RETURN id(p) as id',
+                'MATCH (a:Artist)-[:HAS_GENRE]->(g:Genre) RETURN id(g) AS source, id(a) AS target')
+            """)
+    
+    res = neo4j.run("""
+            CALL gds.nodeSimilarity.write('genre-has-artist', {
+                writeRelationshipType: 'SIMILAR_TO',
+                writeProperty: 'score'
+            })
+            """)
+    
+    res = neo4j.run("""
+            CALL gds.graph.project(
+                'genre-similar-to-genre',
+                'Genre', {SIMILAR_TO: {orientation: 'NATURAL'}},
+                {relationshipProperties:'score'}
+            )
+            """)
+    
+    res = neo4j.run("""
+            CALL gds.louvain.write('genre-similar-to-genre',
+            {relationshipWeightProperty: 'score', writeProperty: 'community'})
+            """)
+    
+    # Post-processing
+    res = neo4j.run("""
+            MATCH (g:Genre)<-[:HAS_GENRE]-(a:Artist)<-[:HAS_ARTIST]-(t:Track)
+            WITH g.community as community, collect(g) as genres, count(DISTINCT t) as trackCount
+            WHERE trackCount < 10 
+            UNWIND genres as g
+            SET g.community = -1
+            """)
+    
+    # Super Genre
+    neo4j.run("""
+            MATCH (g:Genre)
+            WITH DISTINCT g.community as community
+            CREATE (s:SuperGenre {id: community})
+            WITH s
+            MATCH (g:Genre {community: s.id})
+            CREATE (g)-[:PART_OF]->(s)
+            """)
+    
+    neo4j.run("""
+            MATCH (t:Track)-[:HAS_ARTIST]->()-[:HAS_GENRE]->()-[:PART_OF]->(s:SuperGenre)
+            WITH DISTINCT t,s
+            CREATE (t)-[:HAS_SUPER_GENRE]->(s)
+            """)
+    
+    neo4j.run("""
+            MATCH (s:SuperGenre)--(t:Track)
+            WITH s, avg(t.valence) as valence, avg(t.energy) as energy
+            SET s.valence = valence, s.energy = energy
+            """)
 
 def generate_graph():
     neo4j = initiate_neo4j_session(url=os.getenv("NEO4J_URL"), username=os.getenv("NEO4J_USERNAME"), password=os.getenv("NEO4J_PASSWORD"))
@@ -51,6 +143,7 @@ def get_songs():
     results = {}
     while songs['next'] or songs['previous'] is None:
         for song in songs['items']:
+            # print(song)
             if song['track']['id']:
                 song['track']['artists'] = [artist if type(artist) == str else artist['id'] for artist in song['track']['artists']]
                 song['track']['album'] = song['track']['album'] if type(song['track']['album']) == str else song['track']['album']['id']
@@ -61,6 +154,7 @@ def get_songs():
         if not songs['next']:
             break
             songs = spotify.next(songs)
+    # print(results)
     return results
 
 def get_song_audio_features(songs, page_size=100):
@@ -77,6 +171,7 @@ def get_song_audio_features(songs, page_size=100):
             for feature, value in song_features.items():
                 if feature != 'type':
                     songs[song_id][feature] = value
+    # print(songs)
     return songs
 
 def get_album_info(songs, page_size=20):
@@ -116,7 +211,7 @@ def get_artist_info(items, page_size=50):
                 artist['images'] = artist['images'][1]['url']
             artist['followers'] = artist['followers']['total']
             artist['external_urls'] = None
-            all_artists[artist['ids']] = artist
+            all_artists[artist['id']] = artist
     return all_artists
 
 def get_genres(albums, artists):
