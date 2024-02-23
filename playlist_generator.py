@@ -10,7 +10,7 @@ from spotipy.oauth2 import SpotifyClientCredentials, SpotifyOAuth
 load_dotenv()
 
 spotify = spotipy.Spotify(client_credentials_manager=SpotifyClientCredentials(client_id=os.getenv("SPOTIPY_CLIENT_ID"), client_secret=os.getenv("SPOTIPY_CLIENT_SECRET")))
-playlist_limit = 100
+playlist_limit = 6
 
 def load_graph():
     neo4j = initiate_neo4j_session(url=os.getenv("NEO4J_URL"), username=os.getenv("NEO4J_USERNAME"), password=os.getenv("NEO4J_PASSWORD"))
@@ -45,6 +45,12 @@ def load_graph():
     
     print("Clustering Genre using GDS to create Super-Genre")
     cluster_genres(neo4j)
+    
+    print("Creating playlists")
+    generate_playlist(neo4j)
+    
+    print("Printing Playlist")
+    print_playlist(neo4j)
 
 def create_constraints(neo4j):
     res = neo4j.run("SHOW CONSTRAINTS")
@@ -130,6 +136,18 @@ def cluster_genres(neo4j):
             WITH s, avg(t.valence) as valence, avg(t.energy) as energy
             SET s.valence = valence, s.energy = energy
             """)
+
+def print_playlist(neo4j, page_size=100):
+    res = neo4j.run("""
+            MATCH (t:Track)-[:IN_PLAYLIST]->(p:Playlist)
+            RETURN p.valence as valence, p.energy as energy, p.id as playlist, collect(t.id) as tracks
+            """).data()
+    print(res)
+    for item in res:
+        print("Playlist Generated: ")
+        chunks = [item['tracks'][x:x + page_size] for x in range(0, len(item['tracks']), page_size)]
+        for chunk in chunks:
+            print(chunk)
 
 def generate_graph():
     neo4j = initiate_neo4j_session(url=os.getenv("NEO4J_URL"), username=os.getenv("NEO4J_USERNAME"), password=os.getenv("NEO4J_PASSWORD"))
@@ -226,25 +244,27 @@ def get_genres(albums, artists):
 
 def generate_playlist(neo4j):
     res = neo4j.run("""MATCH (p:Playlist) DETACH DELETE p""").data()
-    res = neo4j.run("""MATCH (s:SuperGenre)--(t:Track) RETURN s.id, count(t) as count""").data()
+    res = neo4j.run("""MATCH (s:SuperGenre)-[]-(t:Track) RETURN s.id, count(t) as count""").data()
     big_super_genres = [x['s.id'] for x in res if x['count'] >= playlist_limit]
+    # print(big_super_genres)
     for super_genre in big_super_genres:
+        # print(super_genre)
         make_playlist_for_big(neo4j, super_genre_id=super_genre)
 
 
-def make_playlist_for_big(neo4j, super_genre_id=698):
+def make_playlist_for_big(neo4j, super_genre_id=14):
     res = neo4j.run("""
-        MATCH (s.SuperGenre{id: $superGenre})--(t:Track)
+        MATCH (s:SuperGenre{id: $superGenre})--(t:Track)
         RETURN t.id, t.danceability, t.valence as valence, t.energy as energy
     """, parameters={'superGenre': super_genre_id}).data()
-    x = pd.DataFrame.from_records(result)
+    x = pd.DataFrame.from_records(res)
     
-    kmeans = KMeans(n_clusters=int(len(result) / playlist_limit) + 1, random_state=0).fit(
+    kmeans = KMeans(n_clusters=int(len(res) / playlist_limit)+1, random_state=0).fit(
         x[['energy', 'valence']]
     )
-    if plot_kmeans_clusters:
-        plt.scatter(x['energy'], x['valence'], c=kmeans.labels_, s=50, cmap='viridis')
-        plt.show()
+    # if True:
+    #     plt.scatter(x['energy'], x['valence'], c=kmeans.labels_, s=50, cmap='viridis')
+    #     plt.show()
     x['label'] = kmeans.labels_
     
     output = x[['t.id', 'label']].values.tolist()
@@ -255,14 +275,7 @@ def make_playlist_for_big(neo4j, super_genre_id=698):
         SET p.energy = $centers[row[1]][0]
         SET p.valence = $centers[row[1]][1]
         CREATE (t)-[:IN_PLAYLIST]->(p)
-    """, parameters={'output':output, 'superGenre':super_genre_id, 'ceneters':kmeans.cluster_centers_.tolist()})
-
-def create_playlist(neo4j, page_size=100):
-    res = neo4j.run("""
-        MATCH (n:Playlist)-[:IN_PLAYLIST]-(t:Track)
-        RETURN n.name as name, n.valence as valence, n.energy as energy, n.id as playlist, collect(t.id) as tracks
-    """).data()
-    print(res)
+    """, parameters={'output':output, 'superGenre':super_genre_id, 'centers':kmeans.cluster_centers_.tolist()})
     
 
 if __name__=='__main__':
